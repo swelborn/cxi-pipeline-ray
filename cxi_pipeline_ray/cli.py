@@ -22,17 +22,18 @@ def setup_logging(level: str):
     """
     Configure logging for the application.
 
+
     Args:
         level: Logging level (DEBUG, INFO, WARNING, ERROR)
     """
     numeric_level = getattr(logging, level.upper(), None)
     if not isinstance(numeric_level, int):
-        raise ValueError(f'Invalid log level: {level}')
+        raise ValueError(f"Invalid log level: {level}")
 
     logging.basicConfig(
         level=numeric_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
 
@@ -50,10 +51,10 @@ def validate_configs_mode(args):
 
     # Load both configs
     try:
-        with open(args.pipeline_config, 'r') as f:
+        with open(args.pipeline_config, "r") as f:
             pipeline_config = yaml.safe_load(f)
 
-        with open(args.writer_config, 'r') as f:
+        with open(args.writer_config, "r") as f:
             writer_config = yaml.safe_load(f)
 
         # Validate consistency
@@ -85,73 +86,55 @@ Examples:
 
   # Validate config consistency
   cxi-writer --validate-config --pipeline-config pipeline.yaml --writer-config writer.yaml
-        """
+        """,
     )
 
-    parser.add_argument('--version', action='version', version=f'cxi-pipeline-ray {__version__}')
+    parser.add_argument("--version", action="version", version=f"cxi-pipeline-ray {__version__}")
 
     # Config file or validation mode
+    parser.add_argument("--config", type=str, help="Path to writer configuration YAML file")
+
     parser.add_argument(
-        '--config',
-        type=str,
-        help='Path to writer configuration YAML file'
+        "--validate-config",
+        action="store_true",
+        help="Validate configuration consistency between pipeline and writer",
     )
 
     parser.add_argument(
-        '--validate-config',
-        action='store_true',
-        help='Validate configuration consistency between pipeline and writer'
+        "--pipeline-config", type=str, help="Path to pipeline configuration (for validation mode)"
     )
 
     parser.add_argument(
-        '--pipeline-config',
-        type=str,
-        help='Path to pipeline configuration (for validation mode)'
-    )
-
-    parser.add_argument(
-        '--writer-config',
-        type=str,
-        help='Path to writer configuration (for validation mode)'
+        "--writer-config", type=str, help="Path to writer configuration (for validation mode)"
     )
 
     # CLI overrides
     parser.add_argument(
-        '--batches-per-file',
-        type=int,
-        help='Write CXI file every N batches (default: 10)'
+        "--batches-per-file", type=int, help="Write CXI file every N batches (default: 10)"
     )
 
     parser.add_argument(
-        '--save-segmentation-maps',
-        action='store_true',
-        help='Save segmentation maps to /entry_1/result_1/segmentation_map (debug mode)'
+        "--save-segmentation-maps",
+        action="store_true",
+        help="Save segmentation maps to /entry_1/result_1/segmentation_map (debug mode)",
     )
 
+    parser.add_argument("--output-dir", type=str, help="Override output directory")
+
+    parser.add_argument("--file-prefix", type=str, help="Override CXI file prefix")
+
     parser.add_argument(
-        '--output-dir',
+        "--geom-file",
         type=str,
-        help='Override output directory'
+        help="Geometry file for CrystFEL coordinate conversion. When provided, enables CrystFEL mode with additional LCLS datasets for downstream compatibility.",
     )
 
     parser.add_argument(
-        '--file-prefix',
+        "--log-level",
         type=str,
-        help='Override CXI file prefix'
-    )
-
-    parser.add_argument(
-        '--geom-file',
-        type=str,
-        help='Geometry file for CrystFEL coordinate conversion. When provided, enables CrystFEL mode with additional LCLS datasets for downstream compatibility.'
-    )
-
-    parser.add_argument(
-        '--log-level',
-        type=str,
-        default='INFO',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        help='Logging level (default: INFO)'
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)",
     )
 
     args = parser.parse_args()
@@ -192,10 +175,7 @@ Examples:
     # Connect to Ray
     logger.info("Connecting to Ray cluster...")
     try:
-        ray.init(
-            namespace=config['ray']['namespace'],
-            ignore_reinit_error=True
-        )
+        ray.init(namespace=config["ray"]["namespace"], ignore_reinit_error=True)
         logger.info(f"Connected to Ray cluster: {ray.cluster_resources()}")
     except Exception as e:
         logger.error(f"Failed to connect to Ray: {e}")
@@ -208,14 +188,16 @@ Examples:
         from peaknet_pipeline_ray.utils.queue import ShardedQueueManager
 
         q2_manager = ShardedQueueManager(
-            base_name=config['queue']['name'],
-            num_shards=config['queue']['num_shards'],
-            maxsize_per_shard=config['queue'].get('maxsize_per_shard', 1600)
+            base_name=config["queue"]["name"],
+            num_shards=config["queue"]["num_shards"],
+            maxsize_per_shard=config["queue"].get("maxsize_per_shard", 1600),
         )
         logger.info("Successfully connected to Q2 queue")
-    except ImportError as e:
+    except ImportError:
         logger.error("Failed to import ShardedQueueManager from peaknet-pipeline-ray")
-        logger.error("Make sure peaknet-pipeline-ray is installed: pip install peaknet-pipeline-ray")
+        logger.error(
+            "Make sure peaknet-pipeline-ray is installed: pip install peaknet-pipeline-ray"
+        )
         sys.exit(1)
     except Exception as e:
         logger.error(f"Failed to connect to Q2 queue: {e}")
@@ -223,16 +205,16 @@ Examples:
 
     # Create file writer actor
     logger.info("Creating CXI file writer actor...")
-    geom_file = config.get('geometry', {}).get('geom_file')
+    geom_file = config.get("geometry", {}).get("geom_file")
     file_writer = CXIFileWriterActor.remote(
-        output_dir=config['output']['output_dir'],
+        output_dir=config["output"]["output_dir"],
         geom_file=geom_file,
-        buffer_size=config['output']['buffer_size'],
-        min_num_peak=config['peak_finding']['min_num_peak'],
-        max_num_peak=config['peak_finding']['max_num_peak'],
-        file_prefix=config['output']['file_prefix'],
+        buffer_size=config["output"]["buffer_size"],
+        min_num_peak=config["peak_finding"]["min_num_peak"],
+        max_num_peak=config["peak_finding"]["max_num_peak"],
+        file_prefix=config["output"]["file_prefix"],
         crystfel_mode=geom_file is not None,
-        save_segmentation_maps=config['output'].get('save_segmentation_maps', False),
+        save_segmentation_maps=config["output"].get("save_segmentation_maps", False),
     )
 
     # Run pipeline
@@ -241,8 +223,8 @@ Examples:
         run_sync_pipeline(
             q2_manager=q2_manager,
             file_writer=file_writer,
-            batches_per_file=config['output']['batches_per_file'],
-            save_segmentation_maps=config['output'].get('save_segmentation_maps', False),
+            batches_per_file=config["output"]["batches_per_file"],
+            save_segmentation_maps=config["output"].get("save_segmentation_maps", False),
         )
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
@@ -250,9 +232,10 @@ Examples:
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
         import traceback
+
         logger.error(traceback.format_exc())
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
