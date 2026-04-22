@@ -11,11 +11,20 @@ Provides deterministic, GPU-free inputs for Tier 1/2/3 tests:
   PipelineOutput. torch is imported lazily inside get_torch_tensor; if torch
   is unavailable in the venv, a numpy-shim with .numpy() and .shape is
   returned instead so coordinator.process_batch continues to work.
-
-Tier 2/3 builders (full PipelineOutput with detector images + physics
-metadata) are added in a later task.
+- FakePreprocessingMetadata: minimal dataclass exposing original_shape /
+  preprocessed_shape, as consumed by coordinator.process_batch and
+  reconstruct_from_arrays.
+- make_synthetic_pipeline_output(B, C, H_orig, W_orig, H_preprocessed,
+  W_preprocessed, ...): Tier 2 builder that wraps make_synthetic_logits with
+  a detector-image tensor (ray.put'd), physics metadata, and a
+  FakePreprocessingMetadata. Returns a fully populated FakePipelineOutput
+  plus ground truth already clipped to the original-detector bounds (mirrors
+  the bottom-right unpadding applied by
+  cxi_pipeline_ray.core.coordinator.process_batch and
+  cxi_pipeline_ray.core.reconstruction.reconstruct_from_arrays).
 """
 
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -241,3 +250,157 @@ class FakePipelineOutput:
             return tensor
         except ImportError:
             return _NumpyTensorShim(self._logits)
+
+
+@dataclass
+class FakePreprocessingMetadata:
+    """
+    Minimal stand-in for a real PreprocessingMetadata object, exposing just
+    the two attributes consumed by
+    cxi_pipeline_ray.core.coordinator.process_batch and
+    cxi_pipeline_ray.core.reconstruction.reconstruct_from_arrays.
+
+    Attributes:
+        original_shape: (B, C, H_orig, W_orig) — pre-padding detector shape.
+        preprocessed_shape: (B*C, 1, H_preprocessed, W_preprocessed) —
+            post-padding shape of the image tensor stored in
+            original_image_ref.
+    """
+
+    original_shape: Tuple[int, int, int, int]
+    preprocessed_shape: Tuple[int, int, int, int]
+
+
+def make_synthetic_pipeline_output(
+    B: int,
+    C: int,
+    H_orig: int,
+    W_orig: int,
+    H_preprocessed: int,
+    W_preprocessed: int,
+    peaks_per_panel: int = 3,
+    peak_locations: Optional[List[List[Tuple[int, int]]]] = None,
+    peak_blob_size: int = 3,
+    photon_wavelength: float = 1.3,
+    timestamp: int = 0,
+    seed: int = 0,
+    draw_peaks_in_image: bool = True,
+) -> Tuple[FakePipelineOutput, List[List[Tuple[int, int]]]]:
+    """
+    Build a fully populated FakePipelineOutput plus ground-truth peaks that
+    survive bottom-right unpadding.
+
+    This is the Tier 2 fixture: it wires up the detector-image reconstruction
+    path and physics metadata so tests can exercise
+    coordinator.process_batch's image writing and
+    wavelength -> energy conversion in addition to peak finding.
+
+    Shapes follow the conventions used in
+    cxi_pipeline_ray.core.reconstruction.reconstruct_from_arrays:
+        original_shape      = (B, C, H_orig, W_orig)
+        preprocessed_shape  = (B*C, 1, H_preprocessed, W_preprocessed)
+    with H_orig <= H_preprocessed and W_orig <= W_preprocessed (bottom-right
+    padding). The coordinator clips peaks with y >= H_orig OR x >= W_orig,
+    and the reconstruction extracts [:, :, :H_orig, :W_orig].
+
+    Args:
+        B: Number of events in the batch.
+        C: Number of panels per event.
+        H_orig: Panel height in original (pre-padding) coordinates.
+        W_orig: Panel width in original (pre-padding) coordinates.
+        H_preprocessed: Panel height after preprocessing (>= H_orig).
+        W_preprocessed: Panel width after preprocessing (>= W_orig).
+        peaks_per_panel: Number of peaks per panel when sampling.
+        peak_locations: Optional explicit (y, x) peaks in PREPROCESSED
+            coordinates (length B*C).
+        peak_blob_size: Blob half-side, passed through to
+            make_synthetic_logits.
+        photon_wavelength: Wavelength value stored in metadata (angstroms).
+        timestamp: Timestamp value stored in metadata. Set nonzero to make
+            CXIFileWriterActor emit the timestamp dataset.
+        seed: PRNG seed used for peak sampling and detector image noise.
+        draw_peaks_in_image: If True, overwrite detector-image pixels at
+            ground-truth peak coordinates with the sentinel value 100.0 so
+            peaks are visually verifiable in tools like check_cxi.ipynb.
+
+    Returns:
+        (fake_output, ground_truth_in_original_coords) where:
+            fake_output: FakePipelineOutput with logits, preprocessing_metadata
+                (FakePreprocessingMetadata), original_image_ref (ray.ObjectRef
+                to a (B*C, 1, H_preprocessed, W_preprocessed) float32 array),
+                and metadata {'photon_wavelength', 'timestamp'} populated.
+            ground_truth_in_original_coords: list of length B*C; each entry
+                contains only those ground-truth peaks that survive clipping
+                to (H_orig, W_orig) bounds (matches the peaks that
+                coordinator.process_batch will actually write to the CXI).
+
+    Notes:
+        - This function calls ray.put, so the caller must have ray.init()
+          active before invoking it.
+        - The detector-image tensor lives in preprocessed coordinates; the
+          reconstruction pipeline will slice it down to
+          (B, C, H_orig, W_orig).
+    """
+    if H_orig > H_preprocessed or W_orig > W_preprocessed:
+        raise ValueError(
+            f"original ({H_orig}x{W_orig}) must fit inside preprocessed "
+            f"({H_preprocessed}x{W_preprocessed}) under bottom-right padding"
+        )
+
+    # Ray is imported lazily so tests (and the smoke import) that never call
+    # this function don't pay the ray import cost and don't require ray.init.
+    import ray
+
+    # (1) Build logits + preprocessed-coord ground truth.
+    logits, ground_truth_preprocessed = make_synthetic_logits(
+        B=B,
+        C=C,
+        H=H_preprocessed,
+        W=W_preprocessed,
+        peaks_per_panel=peaks_per_panel,
+        peak_locations=peak_locations,
+        peak_blob_size=peak_blob_size,
+        seed=seed,
+    )
+
+    # (2) Build a detector-image tensor in preprocessed coordinates.
+    rng = np.random.default_rng(seed)
+    detector_images = rng.standard_normal(
+        (B * C, 1, H_preprocessed, W_preprocessed)
+    ).astype(np.float32)
+
+    # (3) Optionally paint sentinel pixels at peak locations for visual
+    # verification.
+    if draw_peaks_in_image:
+        for panel_idx, panel_peaks in enumerate(ground_truth_preprocessed):
+            for (y, x) in panel_peaks:
+                detector_images[panel_idx, 0, y, x] = 100.0
+
+    # (4) Build the FakePreprocessingMetadata carrying both shapes.
+    metadata_obj = FakePreprocessingMetadata(
+        original_shape=(B, C, H_orig, W_orig),
+        preprocessed_shape=(B * C, 1, H_preprocessed, W_preprocessed),
+    )
+
+    # (5) Ray-put the detector images so the coordinator can ray.get them.
+    original_image_ref = ray.put(detector_images)
+
+    # (6) Assemble the FakePipelineOutput.
+    fake_output = FakePipelineOutput(
+        logits=logits,
+        preprocessing_metadata=metadata_obj,
+        original_image_ref=original_image_ref,
+        metadata={
+            "photon_wavelength": photon_wavelength,
+            "timestamp": timestamp,
+        },
+    )
+
+    # (7) Clip ground truth to original-detector bounds (mirrors
+    # coordinator.py:198-204 keep-if y < H_orig and x < W_orig).
+    ground_truth_in_original_coords: List[List[Tuple[int, int]]] = []
+    for panel_peaks in ground_truth_preprocessed:
+        kept = [(y, x) for (y, x) in panel_peaks if y < H_orig and x < W_orig]
+        ground_truth_in_original_coords.append(kept)
+
+    return fake_output, ground_truth_in_original_coords
