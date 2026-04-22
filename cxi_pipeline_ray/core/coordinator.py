@@ -30,13 +30,13 @@ def group_panels_into_events(batch_info):
         (event_images, event_peaks, event_metadata, event_seg_maps): Tuples for file_writer.submit_processed_batch()
         Note: event_seg_maps can be None if segmentation_maps not provided
     """
-    B = batch_info['B']
-    C = batch_info['C']
-    H_orig = batch_info['H_orig']
-    W_orig = batch_info['W_orig']
-    detector_images_4d = batch_info['detector_images_4d']
-    completed_panels = batch_info['completed_panels']
-    segmentation_maps = batch_info.get('segmentation_maps', None)
+    B = batch_info["B"]
+    C = batch_info["C"]
+    H_orig = batch_info["H_orig"]
+    W_orig = batch_info["W_orig"]
+    detector_images_4d = batch_info["detector_images_4d"]
+    completed_panels = batch_info["completed_panels"]
+    segmentation_maps = batch_info.get("segmentation_maps", None)
 
     # Sort by panel index
     completed_panels.sort(key=lambda x: x[0])
@@ -60,7 +60,9 @@ def group_panels_into_events(batch_info):
 
         # Get segmentation maps for this event: (C, H, W)
         if segmentation_maps is not None:
-            event_seg_map = np.stack(segmentation_maps[panel_start:panel_end])  # (C, H_orig, W_orig)
+            event_seg_map = np.stack(
+                segmentation_maps[panel_start:panel_end]
+            )  # (C, H_orig, W_orig)
         else:
             event_seg_map = None
 
@@ -83,31 +85,41 @@ def group_panels_into_events(batch_info):
                 event_peaks_combined.append([int(panel_idx % C), float(y), float(x)])
 
         # Create metadata for this event
-        photon_energy = batch_info['photon_energy']
-        photon_wavelength = batch_info['photon_wavelength']
-        timestamp = batch_info['timestamp']
+        photon_energy = batch_info["photon_energy"]
+        photon_wavelength = batch_info["photon_wavelength"]
+        timestamp = batch_info["timestamp"]
 
         # Handle array metadata (take event_idx element)
         if isinstance(photon_energy, (list, np.ndarray)):
-            photon_energy = float(photon_energy[event_idx]) if len(photon_energy) > event_idx else float(photon_energy[0])
+            photon_energy = (
+                float(photon_energy[event_idx])
+                if len(photon_energy) > event_idx
+                else float(photon_energy[0])
+            )
         elif photon_energy is not None:
             photon_energy = float(photon_energy)
 
         if isinstance(timestamp, (list, np.ndarray)):
-            timestamp = int(timestamp[event_idx]) if len(timestamp) > event_idx else int(timestamp[0])
+            timestamp = (
+                int(timestamp[event_idx]) if len(timestamp) > event_idx else int(timestamp[0])
+            )
         elif timestamp is not None:
             timestamp = int(timestamp)
 
         event_meta = {
-            'photon_energy': photon_energy if photon_energy is not None else 0.0,
-            'timestamp': timestamp if timestamp is not None else 0,
+            "photon_energy": photon_energy if photon_energy is not None else 0.0,
+            "timestamp": timestamp if timestamp is not None else 0,
         }
 
         if photon_wavelength is not None:
             if isinstance(photon_wavelength, (list, np.ndarray)):
-                event_meta['photon_wavelength'] = float(photon_wavelength[event_idx]) if len(photon_wavelength) > event_idx else float(photon_wavelength[0])
+                event_meta["photon_wavelength"] = (
+                    float(photon_wavelength[event_idx])
+                    if len(photon_wavelength) > event_idx
+                    else float(photon_wavelength[0])
+                )
             else:
-                event_meta['photon_wavelength'] = float(photon_wavelength)
+                event_meta["photon_wavelength"] = float(photon_wavelength)
 
         event_images.append(event_image)
         event_peaks.append(event_peaks_combined)
@@ -131,42 +143,57 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
         Number of events processed
     """
     # Extract logits
-    logits = pipeline_output.get_torch_tensor(device='cpu').numpy()  # (B*C, num_classes, H, W)
+    logits = pipeline_output.get_torch_tensor(device="cpu").numpy()  # (B*C, num_classes, H, W)
 
     # Extract B, C, H_orig, W_orig from preprocessing metadata
     B, C, H_orig, W_orig = None, None, None, None
 
-    if hasattr(pipeline_output, 'preprocessing_metadata') and pipeline_output.preprocessing_metadata is not None:
+    if (
+        hasattr(pipeline_output, "preprocessing_metadata")
+        and pipeline_output.preprocessing_metadata is not None
+    ):
         original_shape = pipeline_output.preprocessing_metadata.original_shape
         B, C, H_orig, W_orig = original_shape
         logging.debug(f"Extracted shape from metadata: B={B}, C={C}, H={H_orig}, W={W_orig}")
     else:
-        logging.warning("NO preprocessing_metadata found! This may cause detector image/seg map mismatch!")
+        logging.warning(
+            "NO preprocessing_metadata found! This may cause detector image/seg map mismatch!"
+        )
 
     # Try to extract detector images (can fail independently)
     detector_images_4d = None
 
-    if hasattr(pipeline_output, 'original_image_ref') and pipeline_output.original_image_ref is not None:
+    if (
+        hasattr(pipeline_output, "original_image_ref")
+        and pipeline_output.original_image_ref is not None
+    ):
         try:
-            if hasattr(pipeline_output, 'preprocessing_metadata') and pipeline_output.preprocessing_metadata is not None:
+            if (
+                hasattr(pipeline_output, "preprocessing_metadata")
+                and pipeline_output.preprocessing_metadata is not None
+            ):
                 ref = pipeline_output.original_image_ref
                 try:
                     original_image = ray.get(ref) if isinstance(ref, ray.ObjectRef) else ref
                 except Exception:
                     # ObjectRef owner (actor) has exited; fall back to the direct array copy
-                    original_image = getattr(pipeline_output, 'original_image', None)
+                    original_image = getattr(pipeline_output, "original_image", None)
                 if original_image is not None:
                     preprocessed_shape = pipeline_output.preprocessing_metadata.preprocessed_shape
-                    detector_images_4d = reconstruct_from_arrays(original_image, original_shape, preprocessed_shape)
+                    detector_images_4d = reconstruct_from_arrays(
+                        original_image, original_shape, preprocessed_shape
+                    )
                     logging.debug(f"Reconstructed detector images: {detector_images_4d.shape}")
             else:
                 ref = pipeline_output.original_image_ref
                 try:
                     original_image_raw = ray.get(ref) if isinstance(ref, ray.ObjectRef) else ref
                 except Exception:
-                    original_image_raw = getattr(pipeline_output, 'original_image', None)
+                    original_image_raw = getattr(pipeline_output, "original_image", None)
                 if original_image_raw is not None:
-                    logging.warning(f"NO preprocessing metadata - using images as-is: {original_image_raw.shape}")
+                    logging.warning(
+                        f"NO preprocessing metadata - using images as-is: {original_image_raw.shape}"
+                    )
                     detector_images_4d = original_image_raw
         except Exception as e:
             logging.warning(f"Failed to extract detector images: {e}")
@@ -175,11 +202,11 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
         logging.warning("NO original_image_ref found! Detector images will be None")
 
     # Extract physics metadata
-    metadata = pipeline_output.metadata if hasattr(pipeline_output, 'metadata') else {}
+    metadata = pipeline_output.metadata if hasattr(pipeline_output, "metadata") else {}
 
     # Handle photon wavelength → energy conversion
-    photon_wavelength = metadata.get('photon_wavelength', None)
-    photon_energy = metadata.get('photon_energy', None)
+    photon_wavelength = metadata.get("photon_wavelength", None)
+    photon_energy = metadata.get("photon_energy", None)
 
     if photon_wavelength is not None:
         if isinstance(photon_wavelength, (list, np.ndarray)):
@@ -187,12 +214,14 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
         else:
             photon_energy = wavelength_to_energy(float(photon_wavelength))
 
-    timestamp = metadata.get('timestamp', None)
+    timestamp = metadata.get("timestamp", None)
 
     # Run peak finding on logits
-    logging.debug(f"Running peak finding on {logits.shape[0]} panels (logits shape: {logits.shape})...")
+    logging.debug(
+        f"Running peak finding on {logits.shape[0]} panels (logits shape: {logits.shape})..."
+    )
     if B and C and logits.shape[0] != B * C:
-        logging.error(f"MISMATCH: logits.shape[0]={logits.shape[0]} but B*C={B*C}!")
+        logging.error(f"MISMATCH: logits.shape[0]={logits.shape[0]} but B*C={B * C}!")
 
     all_peaks = []
     all_seg_maps = [] if save_segmentation_maps else None
@@ -212,7 +241,9 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
                 _, y, x = peak
                 if y < H_orig and x < W_orig:
                     peaks_transformed.append([0, y, x])
-            all_peaks.append(np.array(peaks_transformed) if peaks_transformed else np.array([]).reshape(0, 3))
+            all_peaks.append(
+                np.array(peaks_transformed) if peaks_transformed else np.array([]).reshape(0, 3)
+            )
 
             if save_segmentation_maps:
                 all_seg_maps.append(seg_map[:H_orig, :W_orig])
@@ -227,24 +258,26 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
         completed_panels.append((panel_idx, all_peaks[panel_idx], None))
 
     batch_info = {
-        'completed_panels': completed_panels,
-        'B': B if B is not None else 1,
-        'C': C if C is not None else len(all_peaks),
-        'H_orig': H_orig,
-        'W_orig': W_orig,
-        'detector_images_4d': detector_images_4d,
-        'photon_energy': photon_energy,
-        'photon_wavelength': photon_wavelength,
-        'timestamp': timestamp,
-        'metadata': metadata,
-        'num_panels': len(all_peaks),
-        'segmentation_maps': all_seg_maps,
+        "completed_panels": completed_panels,
+        "B": B if B is not None else 1,
+        "C": C if C is not None else len(all_peaks),
+        "H_orig": H_orig,
+        "W_orig": W_orig,
+        "detector_images_4d": detector_images_4d,
+        "photon_energy": photon_energy,
+        "photon_wavelength": photon_wavelength,
+        "timestamp": timestamp,
+        "metadata": metadata,
+        "num_panels": len(all_peaks),
+        "segmentation_maps": all_seg_maps,
     }
 
     event_images, event_peaks, event_metadata, event_seg_maps = group_panels_into_events(batch_info)
 
     # Submit to file writer
-    file_writer.submit_processed_batch.remote(event_images, event_peaks, event_metadata, event_seg_maps)
+    file_writer.submit_processed_batch.remote(
+        event_images, event_peaks, event_metadata, event_seg_maps
+    )
 
     total_peaks = sum(len(p) for p in all_peaks)
     logging.debug(f"Submitted {len(event_images)} events, {total_peaks} total peaks")
@@ -252,7 +285,9 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
     return len(event_images)
 
 
-def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_segmentation_maps: bool = False):
+def run_sync_pipeline(
+    q2_manager, file_writer, batches_per_file: int = 10, save_segmentation_maps: bool = False
+):
     """
     Synchronous pipeline: pull from Q2, process, write CXI files.
 
@@ -272,6 +307,7 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
     streaming_coordinator = None
     try:
         from peaknet_pipeline_ray.core.coordinator import STREAMING_COORDINATOR_NAME
+
         streaming_coordinator = ray.get_actor(
             STREAMING_COORDINATOR_NAME, namespace="peaknet-pipeline"
         )
@@ -283,7 +319,7 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
     total_events = 0
     batches_since_flush = 0
     empty_polls = 0
-    IDLE_EXIT_POLLS = 600   # fallback: 600 × 0.1 s = 60 s
+    IDLE_EXIT_POLLS = 600  # fallback: 600 × 0.1 s = 60 s
 
     try:
         while True:
@@ -297,7 +333,9 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
                         if completed:
                             q2_size = q2_manager.size()
                             if q2_size == 0:
-                                logger.info(f"StreamingCoordinator reports COMPLETED and Q2 is empty after {batch_count} batches — exiting")
+                                logger.info(
+                                    f"StreamingCoordinator reports COMPLETED and Q2 is empty after {batch_count} batches — exiting"
+                                )
                                 break
                     except Exception:
                         pass  # coordinator exited; fall through to idle check
@@ -306,7 +344,9 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
                     if empty_polls >= IDLE_EXIT_POLLS:
                         q2_size = q2_manager.size()
                         if q2_size == 0:
-                            logger.info(f"Q2 idle for {IDLE_EXIT_POLLS * 0.1:.0f}s and empty after {batch_count} batches — exiting (fallback)")
+                            logger.info(
+                                f"Q2 idle for {IDLE_EXIT_POLLS * 0.1:.0f}s and empty after {batch_count} batches — exiting (fallback)"
+                            )
                             break
                         empty_polls = 0
                 continue
@@ -324,15 +364,19 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
             total_events += num_events
             batches_since_flush += 1
 
-            logger.info(f"Processed batch {batch_count}: {num_events} events (total: {total_events}) | Q2 remaining: {q2_size}")
+            logger.info(
+                f"Processed batch {batch_count}: {num_events} events (total: {total_events}) | Q2 remaining: {q2_size}"
+            )
 
             # Periodic flush: write CXI file every N batches
             if batches_since_flush >= batches_per_file:
                 logger.info(f"=== Writing CXI file after {batches_since_flush} batches ===")
                 stats = ray.get(file_writer.flush_final.remote())
-                logger.info(f"Wrote CXI: {stats['chunks_written']} files, "
-                           f"{stats['total_events_written']} events written, "
-                           f"{stats['total_events_filtered']} events filtered")
+                logger.info(
+                    f"Wrote CXI: {stats['chunks_written']} files, "
+                    f"{stats['total_events_written']} events written, "
+                    f"{stats['total_events_filtered']} events filtered"
+                )
                 batches_since_flush = 0
 
             # Progress logging
@@ -344,6 +388,7 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
     except Exception as e:
         logger.error(f"Error: {e}")
         import traceback
+
         logger.error(traceback.format_exc())
     finally:
         # Final flush
