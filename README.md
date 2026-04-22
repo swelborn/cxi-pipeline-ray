@@ -135,6 +135,85 @@ For detailed architecture documentation, see:
 - `PLAN-Q2-CXI-WRITER-ARCH.md` - Implementation architecture
 - `RAY-BEST-PRACTICES-REVIEW.md` - Ray optimizations
 
+## Testing
+
+The test suite is organized into three tiers that trade speed for realism.
+Each tier is independently runnable and exercises a different slice of the
+writer output path without needing a running pipeline or a GPU.
+
+| Tier | What it covers | Data source | Ray | GPU | Runtime |
+|------|----------------|-------------|-----|-----|---------|
+| 1 | Peak-finding correctness and offline writer end-to-end | Hand-crafted logits (argmax to known peaks) | Local cluster for the writer actor only | No | seconds |
+| 2 | Detector-image reconstruction, physics metadata, coordinate clipping | Full synthetic `PipelineOutput` (logits + detector image + metadata) | Local cluster | No | ~minute |
+| 3 | Q2 injection throughput — load-testing the writer under controlled input rate | Synthetic `PipelineOutput` pushed through `ShardedQueueManager` | Full local cluster + `cxi-writer` subprocess | No | minutes to hours |
+
+Tier 1 and Tier 2 are pytest tests. Tier 3 is a standalone CLI script meant
+for before/after comparisons when changing the writer (e.g. Axis-1 or Axis-2
+parallelization work).
+
+### How to run
+
+Install the package with dev extras, then run the pytest suite (Tier 1 + 2)
+and the benchmark harness (Tier 3) separately:
+
+```bash
+# Install pytest, ruff, black alongside the package
+pip install -e '.[dev]'
+
+# Tier 1 + Tier 2 (pytest)
+pytest tests/ -v
+
+# Tier 3 (standalone harness — see --help for all flags)
+python tests/bench_q2_inject.py --help
+```
+
+Tier 3 requires `peaknet-pipeline-ray` for its `ShardedQueueManager`:
+
+```bash
+pip install git+https://github.com/carbonscott/peaknet-pipeline-ray
+```
+
+### Test files
+
+| File | Tier | What it verifies |
+|------|------|------------------|
+| `tests/fixtures.py` | 1 + 2 | Fixture builders — no assertions, imported by the other test files |
+| `tests/test_peak_finding.py` | 1 | `find_peaks_numpy` recovers ground-truth peaks from synthetic logits |
+| `tests/test_writer_offline.py` | 1 | `CXIFileWriterActor.process_batch` -> flush -> CXI file write path, using logits-only fixture |
+| `tests/test_writer_tier2.py` | 2 | Detector image in `/entry_1/data_1/data`, photon-energy derivation, timestamp round-trip, edge-peak clipping |
+| `tests/bench_q2_inject.py` | 3 | Q2 injection throughput — controlled rate, subprocess writer, full report |
+
+### Fixture API
+
+`tests/fixtures.py` exports three builders used across Tier 1 and Tier 2:
+
+- `make_synthetic_logits(B, C, H, W, peaks_per_panel=3, peak_locations=None, peak_blob_size=3, seed=0) -> (logits, ground_truth)`
+  — returns a `(B*C, 2, H, W)` float32 logits tensor whose argmax places peak
+  blobs at known integer coordinates, plus a `List[List[Tuple[int, int]]]` of
+  those coordinates per panel. Class 0 is background, class 1 is peak
+  (matches `cxi_pipeline_ray.core.peak_finding`). When `peak_locations` is
+  `None`, peaks are sampled via `np.random.default_rng(seed)` with a
+  rejection-sampling loop that enforces minimum spacing so the blobs do not
+  merge under scipy's 8-connectivity labeling.
+
+- `make_synthetic_pipeline_output(B, C, H_orig, W_orig, H_preprocessed, W_preprocessed, peaks_per_panel=3, peak_locations=None, peak_blob_size=3, photon_wavelength=1.3, timestamp=0, seed=0, draw_peaks_in_image=True) -> (FakePipelineOutput, ground_truth)`
+  — Tier 2 extension that also builds a synthetic detector-image tensor
+  (`ray.put`-ed so the writer can reconstruct from it) and physics metadata
+  (`photon_wavelength`, `timestamp`). The returned `ground_truth` is clipped
+  to the original (pre-padding) detector shape, mirroring the bottom-right
+  padding assumption in `coordinator.process_batch`.
+
+- `FakePipelineOutput(logits, preprocessing_metadata=None, original_image_ref=None, metadata=None)`
+  — duck-typed stand-in for a real `PipelineOutput`. Exposes the attributes
+  the coordinator reads (`preprocessing_metadata`, `original_image_ref`,
+  `metadata`) and a `get_torch_tensor(device='cpu')` method that imports
+  torch lazily — falling back to a numpy-shim object if torch is not
+  installed in the dev venv.
+
+Tier 2 tests also use a small `FakePreprocessingMetadata` dataclass
+(`original_shape`, `preprocessed_shape`) instantiated internally by
+`make_synthetic_pipeline_output`.
+
 ## Performance Tuning
 
 ### Symptoms and Solutions
@@ -164,13 +243,8 @@ watch -n 5 'ls -lh /output/dir/*.cxi'
 
 ### Running Tests
 
-```bash
-# Unit tests
-pytest tests/
-
-# Integration test (requires running pipeline)
-# See tests/test_integration.py for details
-```
+See the [Testing](#testing) section above for the three-tier test suite
+(pytest fixtures, offline writer end-to-end, and Q2 injection benchmark).
 
 ### Code Style
 
