@@ -149,14 +149,25 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
     if hasattr(pipeline_output, 'original_image_ref') and pipeline_output.original_image_ref is not None:
         try:
             if hasattr(pipeline_output, 'preprocessing_metadata') and pipeline_output.preprocessing_metadata is not None:
-                original_image = ray.get(pipeline_output.original_image_ref)
-                preprocessed_shape = pipeline_output.preprocessing_metadata.preprocessed_shape
-                detector_images_4d = reconstruct_from_arrays(original_image, original_shape, preprocessed_shape)
-                logging.debug(f"Reconstructed detector images: {detector_images_4d.shape}")
+                ref = pipeline_output.original_image_ref
+                try:
+                    original_image = ray.get(ref) if isinstance(ref, ray.ObjectRef) else ref
+                except Exception:
+                    # ObjectRef owner (actor) has exited; fall back to the direct array copy
+                    original_image = getattr(pipeline_output, 'original_image', None)
+                if original_image is not None:
+                    preprocessed_shape = pipeline_output.preprocessing_metadata.preprocessed_shape
+                    detector_images_4d = reconstruct_from_arrays(original_image, original_shape, preprocessed_shape)
+                    logging.debug(f"Reconstructed detector images: {detector_images_4d.shape}")
             else:
-                original_image_raw = ray.get(pipeline_output.original_image_ref)
-                logging.warning(f"NO preprocessing metadata - using images as-is: {original_image_raw.shape}")
-                detector_images_4d = original_image_raw
+                ref = pipeline_output.original_image_ref
+                try:
+                    original_image_raw = ray.get(ref) if isinstance(ref, ray.ObjectRef) else ref
+                except Exception:
+                    original_image_raw = getattr(pipeline_output, 'original_image', None)
+                if original_image_raw is not None:
+                    logging.warning(f"NO preprocessing metadata - using images as-is: {original_image_raw.shape}")
+                    detector_images_4d = original_image_raw
         except Exception as e:
             logging.warning(f"Failed to extract detector images: {e}")
             detector_images_4d = None
@@ -256,9 +267,23 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
     logger.info(f"Batches per file: {batches_per_file}")
     logger.info(f"Save segmentation maps: {save_segmentation_maps}")
 
+    # Try to find the StreamingCoordinator by name so we can use its
+    # is_completed() method as the exit signal instead of timing heuristics.
+    streaming_coordinator = None
+    try:
+        from peaknet_pipeline_ray.core.coordinator import STREAMING_COORDINATOR_NAME
+        streaming_coordinator = ray.get_actor(
+            STREAMING_COORDINATOR_NAME, namespace="peaknet-pipeline"
+        )
+        logger.info("Connected to StreamingCoordinator — will exit when pipeline reports COMPLETED")
+    except Exception:
+        logger.warning("StreamingCoordinator not found by name — falling back to 60s idle exit")
+
     batch_count = 0
     total_events = 0
     batches_since_flush = 0
+    empty_polls = 0
+    IDLE_EXIT_POLLS = 600   # fallback: 600 × 0.1 s = 60 s
 
     try:
         while True:
@@ -266,7 +291,28 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
             pipeline_output = q2_manager.get(timeout=0.1)
 
             if pipeline_output is None:
+                if streaming_coordinator is not None:
+                    try:
+                        completed = ray.get(streaming_coordinator.is_completed.remote())
+                        if completed:
+                            q2_size = q2_manager.size()
+                            if q2_size == 0:
+                                logger.info(f"StreamingCoordinator reports COMPLETED and Q2 is empty after {batch_count} batches — exiting")
+                                break
+                    except Exception:
+                        pass  # coordinator exited; fall through to idle check
+                if batch_count > 0:
+                    empty_polls += 1
+                    if empty_polls >= IDLE_EXIT_POLLS:
+                        q2_size = q2_manager.size()
+                        if q2_size == 0:
+                            logger.info(f"Q2 idle for {IDLE_EXIT_POLLS * 0.1:.0f}s and empty after {batch_count} batches — exiting (fallback)")
+                            break
+                        empty_polls = 0
                 continue
+
+            empty_polls = 0
+            q2_size = q2_manager.size()
 
             # Process batch
             num_events = process_batch(
@@ -278,7 +324,7 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
             total_events += num_events
             batches_since_flush += 1
 
-            logger.info(f"Processed batch {batch_count}: {num_events} events (total: {total_events})")
+            logger.info(f"Processed batch {batch_count}: {num_events} events (total: {total_events}) | Q2 remaining: {q2_size}")
 
             # Periodic flush: write CXI file every N batches
             if batches_since_flush >= batches_per_file:
