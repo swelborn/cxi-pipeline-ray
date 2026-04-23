@@ -6,11 +6,90 @@ and submits results to the CXI file writer actor.
 """
 
 import logging
+from typing import Optional, Tuple
+
 import numpy as np
 import ray
 
 from .peak_finding import find_peaks_numpy
 from .reconstruction import reconstruct_from_arrays, wavelength_to_energy
+
+
+def _find_peaks_panel(
+    panel_logits: np.ndarray,
+    H_orig: Optional[int],
+    W_orig: Optional[int],
+    save_segmentation_maps: bool,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Run peak finding on a single panel's logits and clip peaks to original
+    detector bounds.
+
+    This is the per-panel body that used to live inline in `process_batch`.
+    It is pulled out so it can be called both sequentially (num_cpu_workers=1)
+    and as the body of a Ray remote task (num_cpu_workers>1) without logic
+    drift between the two code paths.
+
+    Args:
+        panel_logits: (2, H, W) logits for one panel.
+        H_orig: Original detector height before bottom-right padding, or None
+            to skip the clip.
+        W_orig: Original detector width before bottom-right padding, or None
+            to skip the clip.
+        save_segmentation_maps: If True, also return the (H_orig, W_orig)
+            uint8 segmentation map (clipped to original bounds).
+
+    Returns:
+        (peaks, seg_map) where
+        - peaks is an (N, 3) float array with rows [panel_idx=0, y, x], peaks
+          outside (H_orig, W_orig) already dropped.
+        - seg_map is None when save_segmentation_maps=False, otherwise a
+          uint8 array clipped to (H_orig, W_orig) when those are provided.
+    """
+    if save_segmentation_maps:
+        peaks, seg_map = find_peaks_numpy(panel_logits, return_seg_map=True)
+    else:
+        peaks = find_peaks_numpy(panel_logits)
+        seg_map = None
+
+    # Clip peaks to original bounds (bottom-right padding assumption).
+    if H_orig is not None and W_orig is not None:
+        peaks_clipped = []
+        for peak in peaks:
+            _, y, x = peak
+            if y < H_orig and x < W_orig:
+                peaks_clipped.append([0, y, x])
+
+        if peaks_clipped:
+            peaks = np.array(peaks_clipped)
+        else:
+            peaks = np.array([]).reshape(0, 3)
+
+        if save_segmentation_maps and seg_map is not None:
+            seg_map = seg_map[:H_orig, :W_orig]
+
+    return peaks, seg_map
+
+
+@ray.remote(num_cpus=1)
+def _find_peaks_task(
+    panel_logits: np.ndarray,
+    H_orig: Optional[int],
+    W_orig: Optional[int],
+    save_segmentation_maps: bool,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Ray remote wrapper around `_find_peaks_panel`. One task per panel.
+
+    Runs on any CPU in the Ray cluster; the per-panel ndarray is the only
+    input that crosses the Ray object store, so serialization cost scales
+    with panel size, not with batch size.
+
+    Each task declares ``num_cpus=1`` as a hard Ray resource requirement, so
+    the cluster must provide at least ``num_panels`` CPUs to reach the
+    fan-out ceiling — with fewer, Ray queues the excess tasks.
+    """
+    return _find_peaks_panel(panel_logits, H_orig, W_orig, save_segmentation_maps)
 
 
 def group_panels_into_events(batch_info):
@@ -118,14 +197,27 @@ def group_panels_into_events(batch_info):
     return event_images, event_peaks, event_metadata, event_seg_maps
 
 
-def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = False):
+def process_batch(
+    pipeline_output,
+    file_writer,
+    save_segmentation_maps: bool = False,
+    num_cpu_workers: int = 1,
+):
     """
     Process a single batch from Q2 through peak finding and submit to writer.
+
+    Peak finding is done panel-by-panel. When `num_cpu_workers > 1`, each
+    panel runs as a Ray task (Axis 1 parallelism — see
+    docs/design/bottleneck-fix-decision.md). When `num_cpu_workers == 1`,
+    the sequential path runs in-process so behavior matches the pre-Axis-1
+    baseline.
 
     Args:
         pipeline_output: PipelineOutput object from Q2
         file_writer: CXIFileWriterActor instance
         save_segmentation_maps: Save segmentation maps to CXI (debug mode)
+        num_cpu_workers: Number of parallel Ray tasks to use for per-panel
+            peak finding. 1 = sequential (no Ray), matches baseline behavior.
 
     Returns:
         Number of events processed
@@ -179,36 +271,37 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
     timestamp = metadata.get('timestamp', None)
 
     # Run peak finding on logits
-    logging.debug(f"Running peak finding on {logits.shape[0]} panels (logits shape: {logits.shape})...")
-    if B and C and logits.shape[0] != B * C:
-        logging.error(f"MISMATCH: logits.shape[0]={logits.shape[0]} but B*C={B*C}!")
+    num_panels = logits.shape[0]
+    logging.debug(
+        f"Running peak finding on {num_panels} panels "
+        f"(logits shape: {logits.shape}, num_cpu_workers={num_cpu_workers})..."
+    )
+    if B and C and num_panels != B * C:
+        logging.error(f"MISMATCH: logits.shape[0]={num_panels} but B*C={B*C}!")
 
-    all_peaks = []
-    all_seg_maps = [] if save_segmentation_maps else None
+    # Axis 1: fan out peak finding across Ray tasks when num_cpu_workers > 1.
+    # At K=1 we stay on the sequential path to keep the pre-Axis-1 behavior
+    # bit-for-bit identical (no Ray task scheduling, no object-store round
+    # trip) — this is what the regression gate in tests/test_writer_*.py
+    # relies on.
+    if num_cpu_workers > 1 and num_panels > 1:
+        refs = [
+            _find_peaks_task.remote(
+                logits[panel_idx], H_orig, W_orig, save_segmentation_maps
+            )
+            for panel_idx in range(num_panels)
+        ]
+        results = ray.get(refs)
+    else:
+        results = [
+            _find_peaks_panel(
+                logits[panel_idx], H_orig, W_orig, save_segmentation_maps
+            )
+            for panel_idx in range(num_panels)
+        ]
 
-    for panel_idx in range(logits.shape[0]):
-        panel_logits = logits[panel_idx]  # (2, H, W)
-
-        if save_segmentation_maps:
-            peaks, seg_map = find_peaks_numpy(panel_logits, return_seg_map=True)
-        else:
-            peaks = find_peaks_numpy(panel_logits)
-
-        # Clip peaks to original bounds
-        if H_orig and W_orig:
-            peaks_transformed = []
-            for peak in peaks:
-                _, y, x = peak
-                if y < H_orig and x < W_orig:
-                    peaks_transformed.append([0, y, x])
-            all_peaks.append(np.array(peaks_transformed) if peaks_transformed else np.array([]).reshape(0, 3))
-
-            if save_segmentation_maps:
-                all_seg_maps.append(seg_map[:H_orig, :W_orig])
-        else:
-            all_peaks.append(peaks)
-            if save_segmentation_maps:
-                all_seg_maps.append(seg_map)
+    all_peaks = [r[0] for r in results]
+    all_seg_maps = [r[1] for r in results] if save_segmentation_maps else None
 
     # Group panels into events
     completed_panels = []
@@ -241,7 +334,13 @@ def process_batch(pipeline_output, file_writer, save_segmentation_maps: bool = F
     return len(event_images)
 
 
-def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_segmentation_maps: bool = False):
+def run_sync_pipeline(
+    q2_manager,
+    file_writer,
+    batches_per_file: int = 10,
+    save_segmentation_maps: bool = False,
+    num_cpu_workers: int = 1,
+):
     """
     Synchronous pipeline: pull from Q2, process, write CXI files.
 
@@ -250,11 +349,14 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
         file_writer: CXIFileWriterActor instance (already created)
         batches_per_file: Write CXI file every N batches
         save_segmentation_maps: Save segmentation maps to CXI (debug mode)
+        num_cpu_workers: Passed through to process_batch for Axis 1 peak-finding
+            parallelism. 1 = sequential (pre-Axis-1 baseline), >1 = Ray tasks.
     """
     logger = logging.getLogger(__name__)
     logger.info("Starting synchronous pipeline loop...")
     logger.info(f"Batches per file: {batches_per_file}")
     logger.info(f"Save segmentation maps: {save_segmentation_maps}")
+    logger.info(f"Peak-finding parallelism (num_cpu_workers): {num_cpu_workers}")
 
     batch_count = 0
     total_events = 0
@@ -273,6 +375,7 @@ def run_sync_pipeline(q2_manager, file_writer, batches_per_file: int = 10, save_
                 pipeline_output,
                 file_writer,
                 save_segmentation_maps=save_segmentation_maps,
+                num_cpu_workers=num_cpu_workers,
             )
             batch_count += 1
             total_events += num_events

@@ -69,6 +69,15 @@ def load_config(config_path: str) -> Dict[str, Any]:
     if 'max_num_peak' not in config['peak_finding']:
         config['peak_finding']['max_num_peak'] = 2048
 
+    # processing.num_cpu_workers controls Axis 1 peak-finding parallelism.
+    # Default 1 = sequential (pre-Axis-1 behavior). Set to >1 in a config or
+    # via the demo's cxi_writer.yaml to fan peak finding across Ray tasks.
+    if 'processing' not in config:
+        config['processing'] = {}
+
+    if 'num_cpu_workers' not in config['processing']:
+        config['processing']['num_cpu_workers'] = 1
+
     if 'buffer_size' not in config['output']:
         config['output']['buffer_size'] = 100
 

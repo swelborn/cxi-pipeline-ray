@@ -1,0 +1,38 @@
+# Post-Task-25 benchmark writer config, K=4 (Axis-1 fan-out).
+# Queue and ray settings mirror baseline bench-writer.yaml. processing.num_cpu_workers=4
+# matches the effective ceiling B*C = 4 panels per batch — each panel becomes one
+# _find_peaks_task.remote() call so any K >= num_panels yields identical fan-out.
+# See docs/design/bottleneck-fix-decision.md §"Effective peak-finding parallelism".
+
+ray:
+  namespace: "peaknet-pipeline-bench-k4"
+
+queue:
+  name: "bench_q2_k4"
+  num_shards: 8
+  maxsize_per_shard: 1600
+  poll_timeout: 0.01
+
+processing:
+  num_cpu_workers: 4
+
+peak_finding:
+  min_num_peak: 1
+  max_num_peak: 1024
+  connectivity: 8
+
+geometry:
+  geom_file: null
+
+output:
+  output_dir: "/tmp/bench-out/placeholder"
+  file_prefix: "bench"
+  buffer_size: 10
+  batches_per_file: 10
+  create_output_dir: true
+  save_segmentation_maps: false
+
+system:
+  log_level: "INFO"
+  log_file: null
+  progress_interval: 50
