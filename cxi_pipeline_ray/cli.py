@@ -182,12 +182,18 @@ Examples:
     # Merge CLI overrides
     config = merge_config_with_overrides(config, args)
 
+    # Peak-finding parallelism (Axis 1). processing.num_cpu_workers = 1 keeps
+    # the pre-Axis-1 sequential behavior; >1 fans out per-panel peak finding
+    # across Ray tasks. See docs/design/bottleneck-fix-decision.md.
+    num_cpu_workers = config.get('processing', {}).get('num_cpu_workers', 1)
+
     logger.info("=== CXI Pipeline Writer ===")
     logger.info(f"Version: {__version__}")
     logger.info(f"Ray namespace: {config['ray']['namespace']}")
     logger.info(f"Queue: {config['queue']['name']} ({config['queue']['num_shards']} shards)")
     logger.info(f"Output dir: {config['output']['output_dir']}")
     logger.info(f"Batches per file: {config['output']['batches_per_file']}")
+    logger.info(f"Peak-finding parallelism (num_cpu_workers): {num_cpu_workers}")
 
     # Connect to Ray
     logger.info("Connecting to Ray cluster...")
@@ -243,6 +249,7 @@ Examples:
             file_writer=file_writer,
             batches_per_file=config['output']['batches_per_file'],
             save_segmentation_maps=config['output'].get('save_segmentation_maps', False),
+            num_cpu_workers=num_cpu_workers,
         )
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

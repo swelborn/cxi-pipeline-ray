@@ -95,14 +95,14 @@ See `examples/configs/cxi_writer_default.yaml` for a fully documented configurat
 
 ### Key Parameters
 
-- `num_cpu_workers`: Parallel Ray tasks (default: 16)
-  - Start with `num_cpu_cores // 4`
-  - Increase if CPU utilization is low
-  - Decrease if task overhead is high
-
-- `max_pending_tasks`: Backpressure limit (default: 100)
-  - Prevents OOM by limiting in-flight work
-  - Lower = less memory, higher = better throughput
+- `processing.num_cpu_workers`: Axis 1 peak-finding parallelism (default: 1)
+  - At `1`, peak finding runs sequentially in-process — identical behavior
+    to the pre-Axis-1 baseline.
+  - At `> 1`, each panel's peak finding runs as a Ray task; the ceiling is
+    `min(num_cpu_workers, B * C)` since each batch only has `B * C` panels
+    to fan out over.
+  - See `docs/design/bottleneck-fix-decision.md` and `docs/benchmarks/` for
+    the benchmark-driven reasoning and sweep numbers.
 
 - `buffer_size`: Events per CXI file (default: 100)
   - Larger = fewer files, more memory
@@ -114,10 +114,14 @@ See `examples/configs/cxi_writer_default.yaml` for a fully documented configurat
 
 The pipeline consists of three main components:
 
-1. **Peak Finding (Ray Task)** - `cxi_pipeline_ray/core/peak_finding.py`
-   - Stateless CPU-based peak finding
+1. **Peak Finding** - `cxi_pipeline_ray/core/peak_finding.py`
+   - Stateless CPU-based peak finding (plain numpy + scipy — no Ray or torch)
    - Converts logits → segmentation maps → peak positions
-   - Uses scipy.ndimage for connected component labeling
+   - Uses `scipy.ndimage` for connected component labeling
+   - Wrapped by `cxi_pipeline_ray.core.coordinator._find_peaks_task` — a
+     `@ray.remote` per-panel task used when
+     `processing.num_cpu_workers > 1` (Axis 1). At `num_cpu_workers = 1`
+     the coordinator runs the plain function sequentially in-process.
 
 2. **File Writer (Ray Actor)** - `cxi_pipeline_ray/core/file_writer.py`
    - Stateful CXI file writer
@@ -220,11 +224,10 @@ Tier 2 tests also use a small `FakePreprocessingMetadata` dataclass
 
 | Symptom | Diagnosis | Solution |
 |---------|-----------|----------|
-| Low CPU utilization (<50%) | Underutilized CPUs | Increase `num_cpu_workers` |
-| High task scheduling overhead | Too many tiny tasks | Decrease `num_cpu_workers` |
-| Q2 queue growing | Writer too slow | Increase `num_cpu_workers` |
-| Memory usage growing | Too many pending tasks | Decrease `max_pending_tasks` |
-| Too many small CXI files | Buffer flushing too often | Increase `buffer_size` |
+| Low CPU utilization (<50%) | Peak-finding not parallelized | Increase `processing.num_cpu_workers` (bounded by `B * C`) |
+| High task scheduling overhead for small batches | Ray task cost dominates | Decrease `processing.num_cpu_workers` (fall back to `1` for sequential) |
+| Q2 queue growing | Writer too slow | Increase `processing.num_cpu_workers` — see `docs/benchmarks/` |
+| Too many small CXI files | Buffer flushing too often | Increase `output.buffer_size` |
 
 ### Monitoring
 
