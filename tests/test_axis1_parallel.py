@@ -125,8 +125,8 @@ def test_k1_and_k4_produce_identical_peaks(ray_cluster, tmp_path):
 
 
 def test_k_greater_than_panels_is_safe(ray_cluster, tmp_path):
-    """Requesting more workers than the batch has panels must not error —
-    the effective parallelism is capped at ``num_panels``."""
+    """Requesting more workers than the batch has panels must not error and
+    must still produce the expected single CXI file."""
     writer = _make_writer(tmp_path)
     pipeline_output = _make_pipeline_output(B=1, C=4, H=64, W=64, seed=0)
     process_batch(pipeline_output, writer, num_cpu_workers=64)

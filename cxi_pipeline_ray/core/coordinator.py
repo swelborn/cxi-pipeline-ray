@@ -53,7 +53,7 @@ def _find_peaks_panel(
         seg_map = None
 
     # Clip peaks to original bounds (bottom-right padding assumption).
-    if H_orig and W_orig:
+    if H_orig is not None and W_orig is not None:
         peaks_clipped = []
         for peak in peaks:
             _, y, x = peak
@@ -84,6 +84,10 @@ def _find_peaks_task(
     Runs on any CPU in the Ray cluster; the per-panel ndarray is the only
     input that crosses the Ray object store, so serialization cost scales
     with panel size, not with batch size.
+
+    Each task declares ``num_cpus=1`` as a hard Ray resource requirement, so
+    the cluster must provide at least ``num_panels`` CPUs to reach the
+    fan-out ceiling — with fewer, Ray queues the excess tasks.
     """
     return _find_peaks_panel(panel_logits, H_orig, W_orig, save_segmentation_maps)
 
