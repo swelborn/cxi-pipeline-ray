@@ -33,23 +33,23 @@ queue:
   poll_timeout: 0.01
 
 # ============================================================
-# CPU Post-Processing Configuration
+# CPU Post-Processing Configuration (Axis 1)
 # ============================================================
 processing:
-  # Number of parallel Ray tasks for peak finding
+  # Number of parallel Ray tasks for peak finding (Axis 1 parallelism).
+  #
+  # Fans per-panel peak finding out across `num_cpu_workers` Ray tasks inside
+  # `cxi_pipeline_ray.core.coordinator.process_batch`. The effective parallelism
+  # ceiling is min(num_cpu_workers, B * C) — each batch only has B * C panels
+  # to work on. See `docs/design/bottleneck-fix-decision.md` and
+  # `docs/benchmarks/` for the benchmark-driven reasoning.
+  #
   # Tuning guide:
-  #   - Start with num_cpu_cores // 4 (conservative)
-  #   - Increase if CPU utilization is low
-  #   - Decrease if task scheduling overhead is high
-  num_cpu_workers: 16
-
-  # Maximum pending tasks (backpressure limit)
-  # Prevents OOM by limiting in-flight work
-  # Tuning guide:
-  #   - Lower (50): Less memory, may underutilize CPUs
-  #   - Higher (200): More memory, better throughput
-  #   - Default (100): Good balance
-  max_pending_tasks: 100
+  #   - 1  = sequential, identical to pre-Axis-1 baseline (use for regression
+  #          checks or when B*C is tiny and Ray overhead would hurt).
+  #   - 4  = matches the current demo (B=1, C=4) — one Ray task per panel.
+  #   - >4 = no additional speedup at B=1, C=4 (panels fan out, not batches).
+  num_cpu_workers: 1
 
 # ============================================================
 # Peak Finding Configuration
@@ -161,9 +161,10 @@ system:
 #
 # With CLI overrides:
 #   cxi-writer --config cxi_writer.yaml \
-#     --num-cpu-workers 32 \
 #     --output-dir /custom/path \
 #     --geom-file /path/to/detector.geom
+#
+# (processing.num_cpu_workers is not a CLI flag — set it in the YAML.)
 #
 # Validate config consistency:
 #   cxi-writer --validate-config \
@@ -175,18 +176,18 @@ system:
 # ============================================================
 #
 # If CPU utilization is low (<50%):
-#   - Increase num_cpu_workers
-#
-# If memory usage grows unbounded:
-#   - Decrease max_pending_tasks
-#   - Decrease buffer_size
+#   - Increase processing.num_cpu_workers (bounded by B * C)
 #
 # If Q2 queue is growing:
-#   - Writer is too slow, increase num_cpu_workers
-#   - Or check if peak finding is bottleneck
+#   - Writer is too slow — increase processing.num_cpu_workers
+#   - Or verify peak finding is the bottleneck with the Tier-3
+#     bench_q2_inject.py harness (see README.md "Testing" section)
+#
+# If memory usage grows unbounded:
+#   - Decrease output.buffer_size
 #
 # If too many small CXI files:
-#   - Increase buffer_size
+#   - Increase output.buffer_size
 #
 # ============================================================
 # Critical Settings Checklist
@@ -198,4 +199,5 @@ system:
 #   [ ] queue.num_shards matches pipeline's queue_num_shards
 #   [ ] geometry.geom_file exists (if not null)
 #   [ ] output.output_dir is writable
-#   [ ] num_cpu_workers is reasonable for your node
+#   [ ] processing.num_cpu_workers chosen for your workload — see
+#       docs/design/bottleneck-fix-decision.md for context

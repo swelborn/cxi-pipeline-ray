@@ -1,0 +1,34 @@
+# Minimal writer config for baseline Tier-3 benchmarks (Task 22).
+# Queue and ray settings mirror demo/configs/cxi_writer.yaml so results are
+# comparable to production topology. output_dir is overridden per-run via
+# bench_q2_inject.py --output-dir.
+
+ray:
+  namespace: "peaknet-pipeline-bench"
+
+queue:
+  name: "bench_q2"
+  num_shards: 8
+  maxsize_per_shard: 1600
+  poll_timeout: 0.01
+
+peak_finding:
+  min_num_peak: 1
+  max_num_peak: 1024
+  connectivity: 8
+
+geometry:
+  geom_file: null
+
+output:
+  output_dir: "/tmp/bench-out/placeholder"
+  file_prefix: "bench"
+  buffer_size: 10
+  batches_per_file: 10
+  create_output_dir: true
+  save_segmentation_maps: false
+
+system:
+  log_level: "INFO"
+  log_file: null
+  progress_interval: 50
